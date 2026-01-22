@@ -1,0 +1,30 @@
+# Core dependencies
+numpy>=1.24.0,<2.0.0
+opencv-python>=4.8.0
+mediapipe>=0.10.0
+
+# Visualization
+matplotlib>=3.7.0
+pillow>=10.0.0
+
+# Utilities
+pyyaml>=6.0
+scipy>=1.11.0
+tqdm>=4.65.0
+
+# Optional: YOLO backend
+ultralytics>=8.0.0
+
+# Optional: Advanced analytics
+pandas>=2.0.0
+scikit-learn>=1.3.0
+
+# Development
+pytest>=7.4.0
+black>=23.0.0
+flake8>=6.0.0
+mypy>=1.5.0
+
+# Documentation
+sphinx>=7.0.0
+sphinx-rtd-theme>=1.3.0
