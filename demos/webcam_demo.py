@@ -1,17 +1,5 @@
 #!/usr/bin/env python3
-"""Real-time webcam pose estimation demo.
-
-This demo captures video from your webcam and performs real-time pose estimation
-with joint angle calculations and visualization.
-
-Usage:
-    python demos/webcam_demo.py [--camera CAMERA_ID] [--backend BACKEND]
-
-Controls:
-    - Press 'q' to quit
-    - Press 's' to save screenshot
-    - Press 'r' to reset statistics
-"""
+"""Real-time pose estimation demo (Webcam or Local Video) with Recording."""
 
 import sys
 import argparse
@@ -31,12 +19,27 @@ from src.visualization.skeleton_renderer import SkeletonRenderer
 
 def parse_args():
     """Parse command line arguments."""
-    parser = argparse.ArgumentParser(description='Real-time pose estimation webcam demo')
+    parser = argparse.ArgumentParser(description='Pose estimation demo (Webcam or Video)')
+    
+    parser.add_argument(
+        '--input',
+        type=str,
+        help='Path to input video file. If not provided, webcam will be used.'
+    )
+    
+    # Output argument for saving the result
+    parser.add_argument(
+        '--output',
+        type=str,
+        default=None,
+        help='Path to save the output video (e.g., output.mp4). If not set, video is not saved.'
+    )
+    
     parser.add_argument(
         '--camera',
         type=int,
         default=0,
-        help='Camera device ID (default: 0)'
+        help='Camera device ID (default: 0). Used only if --input is not set.'
     )
     parser.add_argument(
         '--backend',
@@ -49,13 +52,13 @@ def parse_args():
         '--width',
         type=int,
         default=1280,
-        help='Camera frame width (default: 1280)'
+        help='Camera frame width (default: 1280). Ignored for video files.'
     )
     parser.add_argument(
         '--height',
         type=int,
         default=720,
-        help='Camera frame height (default: 720)'
+        help='Camera frame height (default: 720). Ignored for video files.'
     )
     parser.add_argument(
         '--show-fps',
@@ -75,25 +78,62 @@ def main():
     args = parse_args()
 
     print("=" * 60)
-    print("Motion Tracker - Real-time Webcam Demo")
+    print("Motion Tracker - Demo")
     print("=" * 60)
-    print(f"Camera ID: {args.camera}")
+
+    is_video_file = args.input is not None
+    
+    if is_video_file:
+        print(f"Input Mode: Local Video File")
+        print(f"File Path: {args.input}")
+        cap = cv2.VideoCapture(args.input)
+    else:
+        print(f"Input Mode: Webcam")
+        print(f"Camera ID: {args.camera}")
+        print(f"Target Resolution: {args.width}x{args.height}")
+        cap = cv2.VideoCapture(args.camera)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
+
     print(f"Backend: {args.backend}")
-    print(f"Resolution: {args.width}x{args.height}")
     print("\nControls:")
     print("  - Press 'q' to quit")
     print("  - Press 's' to save screenshot")
     print("  - Press 'r' to reset statistics")
     print("=" * 60)
 
-    # Initialize camera
-    cap = cv2.VideoCapture(args.camera)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
-
     if not cap.isOpened():
-        print(f"Error: Could not open camera {args.camera}")
+        source_name = args.input if is_video_file else f"Camera {args.camera}"
+        print(f"Error: Could not open {source_name}")
         return 1
+
+    # ---------------------------------------------------------
+    # Initialize video recording (VideoWriter)
+    # ---------------------------------------------------------
+    video_writer = None
+    if args.output:
+        # Get source video/webcam dimensions and FPS
+        # Note: Even if flipped, dimensions usually remain the same, so .get() is sufficient
+        original_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        original_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        original_fps = cap.get(cv2.CAP_PROP_FPS)
+
+        # If FPS cannot be read (some cameras return 0 or nan), set a default of 30
+        if not original_fps or original_fps <= 0 or np.isnan(original_fps):
+            original_fps = 30.0
+
+        print(f"Initializing Video Writer: {args.output}")
+        print(f"  - Resolution: {original_width}x{original_height}")
+        print(f"  - FPS: {original_fps}")
+
+        # 'mp4v' is a generic MP4 codec. If it fails, try 'avc1' or 'XVID' (with .avi)
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v') 
+        video_writer = cv2.VideoWriter(
+            args.output, 
+            fourcc, 
+            original_fps, 
+            (original_width, original_height)
+        )
 
     # Initialize pose estimator
     print("\nInitializing pose estimator...")
@@ -112,26 +152,22 @@ def main():
         return 1
 
     print(f"[OK] Initialized {estimator.backend_name} backend")
-    print(f"[OK] Detecting {estimator.num_keypoints} keypoints")
-
-    # Initialize angle calculator and motion analyzer
+    
     angle_calculator = AngleCalculator(use_3d=True)
     motion_analyzer = MotionAnalyzer(buffer_size=30, smoothing_window=5)
 
-    # Initialize renderer
     renderer = SkeletonRenderer(
         show_keypoints=True,
         show_connections=True,
         show_labels=False,
     )
 
-    # FPS calculation
     fps_history = []
     frame_count = 0
     start_time = time.time()
     screenshot_count = 0
 
-    print("\nStarting real-time detection...\n")
+    print("\nStarting detection...\n")
 
     try:
         while True:
@@ -139,21 +175,23 @@ def main():
 
             # Capture frame
             ret, frame = cap.read()
+            
             if not ret:
-                print("Error: Failed to capture frame")
+                if is_video_file:
+                    print("\nEnd of video file reached.")
+                else:
+                    print("Error: Failed to capture frame")
                 break
 
-            # Flip frame horizontally for mirror effect
-            frame = cv2.flip(frame, 1)
+            if not is_video_file:
+                frame = cv2.flip(frame, 1)
 
             # Process pose
             pose_result = estimator.process_frame(frame)
 
             if pose_result and pose_result.is_valid():
-                # Update motion analyzer
                 motion_analyzer.update(pose_result)
 
-                # Calculate angles
                 angles = None
                 if not args.no_angles:
                     angles = angle_calculator.calculate_all_angles(pose_result)
@@ -161,10 +199,8 @@ def main():
                 # Render skeleton and angles
                 frame = renderer.render(frame, pose_result, angles)
 
-                # Calculate posture metrics
                 posture_metrics = angle_calculator.calculate_posture_metrics(pose_result)
 
-                # Prepare statistics - show in two panels
                 # Left panel: Posture metrics
                 posture_stats = {}
                 if posture_metrics.get('head_tilt') is not None:
@@ -183,9 +219,7 @@ def main():
                     'Confidence': f"{pose_result.confidence * 100:.0f}%",
                 }
 
-                # Add key angles to stats
                 if angles and not args.no_angles:
-                    # Show major joints
                     key_angles = [
                         'left_elbow', 'right_elbow',
                         'left_shoulder', 'right_shoulder',
@@ -196,13 +230,10 @@ def main():
                         if angles.get(joint) is not None:
                             smoothed = motion_analyzer.get_smoothed_angle(joint)
                             if smoothed:
-                                # Format joint name nicely
                                 joint_name = joint.replace('_', ' ').title()
-                                # Abbreviate for space
                                 joint_name = joint_name.replace('Left', 'L').replace('Right', 'R')
                                 joint_stats[joint_name] = f"{smoothed:.0f}deg"
 
-                # Add FPS if enabled
                 if args.show_fps:
                     current_fps = 1.0 / (time.time() - loop_start + 1e-6)
                     fps_history.append(current_fps)
@@ -211,40 +242,37 @@ def main():
                     avg_fps = np.mean(fps_history)
                     joint_stats['FPS'] = f"{avg_fps:.1f}"
 
-                # Draw stats panels
                 if posture_stats:
                     frame = renderer.draw_stats_panel(frame, posture_stats, position='top_left')
                 frame = renderer.draw_stats_panel(frame, joint_stats, position='top_right')
 
             else:
-                # No pose detected
                 cv2.putText(
-                    frame,
-                    "No pose detected",
-                    (50, 50),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    1.0,
-                    (0, 0, 255),
-                    2,
+                    frame, "No pose detected", (50, 50),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2,
                 )
 
-            # Display frame
-            cv2.imshow('Motion Tracker - Webcam Demo', frame)
+            # ---------------------------------------------------------
+            # If recording is enabled, write the current rendered frame
+            # ---------------------------------------------------------
+            if video_writer is not None:
+                video_writer.write(frame)
 
-            # Handle keyboard input
+            # Display frame
+            window_title = 'Motion Tracker'
+            cv2.imshow(window_title, frame)
+
             key = cv2.waitKey(1) & 0xFF
 
             if key == ord('q'):
                 print("\nQuitting...")
                 break
             elif key == ord('s'):
-                # Save screenshot
                 screenshot_count += 1
                 filename = f"screenshot_{screenshot_count:03d}.png"
                 cv2.imwrite(filename, frame)
                 print(f"Screenshot saved: {filename}")
             elif key == ord('r'):
-                # Reset statistics
                 motion_analyzer.clear_history()
                 fps_history.clear()
                 print("Statistics reset")
@@ -255,7 +283,6 @@ def main():
         print("\n\nInterrupted by user")
 
     finally:
-        # Cleanup
         elapsed_time = time.time() - start_time
         avg_fps = frame_count / elapsed_time if elapsed_time > 0 else 0
 
@@ -265,6 +292,12 @@ def main():
         print(f"Total frames: {frame_count}")
         print(f"Duration: {elapsed_time:.1f}s")
         print(f"Average FPS: {avg_fps:.1f}")
+        
+        # Release VideoWriter
+        if video_writer is not None:
+            video_writer.release()
+            print(f"Output saved to: {args.output}")
+
         print("=" * 60)
 
         cap.release()
