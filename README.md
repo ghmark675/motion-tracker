@@ -168,6 +168,20 @@ python demos/dance_coach_demo.py
 - Overall score (0-100)
 - Save/load reference sequences
 
+### Golf Coach
+
+Compare golf swings using two local video files - a template standard video and a scored video.
+
+```bash
+python demos/golf_coach_demo.py --template-video path/to/template.mp4 --scored-video path/to/scored.mp4
+```
+
+**Features:**
+- DTW algorithm for temporal alignment of different length swings
+- Golf-specific joint analysis (wrist angles, spine curve, etc.)
+- Overall score (0-100) with detailed joint feedback
+- No real-time interaction required - fully batch processing
+
 ## Performance
 
 Tested on MacBook Pro M4:
