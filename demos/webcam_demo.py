@@ -116,7 +116,7 @@ def main():
         # Note: Even if flipped, dimensions usually remain the same, so .get() is sufficient
         original_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         original_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        original_fps = cap.get(cv2.CAP_PROP_FPS)
+        original_fps = round(cap.get(cv2.CAP_PROP_FPS))
 
         # If FPS cannot be read (some cameras return 0 or nan), set a default of 30
         if not original_fps or original_fps <= 0 or np.isnan(original_fps):
