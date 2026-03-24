@@ -85,6 +85,10 @@ pip install -r requirements.txt
 python demos/webcam_demo.py
 ```
 
+```bash
+python demos/webcam_demo.py --input input.mp4 --output result.mp4
+```
+
 ### Basic Usage
 
 ```python
