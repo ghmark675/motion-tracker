@@ -197,7 +197,8 @@ def main():
                     angles = angle_calculator.calculate_all_angles(pose_result)
 
                 # Render skeleton and angles
-                frame = renderer.render(frame, pose_result, angles)
+                frame = renderer.render(frame, pose_result, angles) # render with angles
+                # frame = renderer.render(frame, pose_result, None) # render with no angles
 
                 posture_metrics = angle_calculator.calculate_posture_metrics(pose_result)
 
