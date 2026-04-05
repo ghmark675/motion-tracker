@@ -116,7 +116,7 @@ def main():
         # Note: Even if flipped, dimensions usually remain the same, so .get() is sufficient
         original_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         original_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        original_fps = cap.get(cv2.CAP_PROP_FPS)
+        original_fps = round(cap.get(cv2.CAP_PROP_FPS))
 
         # If FPS cannot be read (some cameras return 0 or nan), set a default of 30
         if not original_fps or original_fps <= 0 or np.isnan(original_fps):
@@ -197,7 +197,8 @@ def main():
                     angles = angle_calculator.calculate_all_angles(pose_result)
 
                 # Render skeleton and angles
-                frame = renderer.render(frame, pose_result, angles)
+                frame = renderer.render(frame, pose_result, angles) # render with angles
+                # frame = renderer.render(frame, pose_result, None) # render with no angles
 
                 posture_metrics = angle_calculator.calculate_posture_metrics(pose_result)
 
