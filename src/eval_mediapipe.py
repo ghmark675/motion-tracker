@@ -7,6 +7,7 @@ import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 from matplotlib.patches import FancyBboxPatch
 import matplotlib.ticker as ticker
+from dotenv import load_dotenv
 
 from src.read_datasets import load_dataset_numpy
 from src.backends.mediapipe_backend import MediaPipeBackend
@@ -14,6 +15,8 @@ from src.backends.mediapipe_backend import MediaPipeBackend
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
+load_dotenv()
+YOLO_DATASET_PATH=os.getenv("YOLO_DATASET_PATH")
 
 COCO_NAMES = [
     "Nose",
@@ -1695,14 +1698,12 @@ def print_cdf_key_points(all_distances, all_norm_distances):
 
 
 def main():
-    base_dir = r"H:\\golf_data\\keyframes_yolo2"
-
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_dir = os.path.join("eval_results", f"mediapipe_{timestamp}")
     os.makedirs(out_dir, exist_ok=True)
     print(f"[INFO] Output directory: '{out_dir}'")
 
-    dataset = load_dataset_numpy(base_dir)
+    dataset = load_dataset_numpy(YOLO_DATASET_PATH)
     total_frames = len(dataset)
 
     mp_backend = MediaPipeBackend(static_image_mode=True)
