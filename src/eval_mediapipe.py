@@ -1,4 +1,5 @@
 import os
+import sys
 import cv2
 import numpy as np
 from tqdm import tqdm
@@ -8,6 +9,8 @@ import matplotlib.gridspec as gridspec
 from matplotlib.patches import FancyBboxPatch
 import matplotlib.ticker as ticker
 from dotenv import load_dotenv
+from loguru import logger
+import matplotlib.patches as mpatches
 
 from src.read_datasets import load_dataset_numpy
 from src.backends.mediapipe_backend import MediaPipeBackend
@@ -16,7 +19,7 @@ from src.backends.mediapipe_backend import MediaPipeBackend
 # Constants
 # ---------------------------------------------------------------------------
 load_dotenv()
-YOLO_DATASET_PATH=os.getenv("YOLO_DATASET_PATH")
+YOLO_DATASET_PATH = os.getenv("YOLO_DATASET_PATH")
 
 COCO_NAMES = [
     "Nose",
@@ -98,6 +101,55 @@ COCO_KP_SIGMAS = np.array(
     ]
 )
 
+_SEP = "=" * 80
+_SEP_THIN = "-" * 80
+
+
+# ---------------------------------------------------------------------------
+# Logging setup
+# ---------------------------------------------------------------------------
+
+
+def setup_logger(log_dir: str) -> str:
+    """
+    Configure loguru:
+      - Remove the default stderr sink.
+      - Add a coloured console sink (INFO and above).
+      - Add a plain-text file sink (DEBUG and above) saved to log_dir.
+
+    Returns the path of the log file created.
+    """
+    logger.remove()  # drop default handler
+
+    # ── Console sink (coloured, INFO+) ──────────────────────────────────────
+    console_fmt = (
+        "<green>{time:HH:mm:ss}</green> | "
+        "<level>{level: <8}</level> | "
+        "<cyan>{function}</cyan> - <level>{message}</level>"
+    )
+    logger.add(sys.stderr, format=console_fmt, level="INFO", colorize=True)
+
+    # ── File sink (plain text, DEBUG+) ───────────────────────────────────────
+    os.makedirs(log_dir, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_path = os.path.join(log_dir, f"eval_{timestamp}.log")
+
+    file_fmt = (
+        "{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {function}:{line} - {message}"
+    )
+    logger.add(
+        log_path,
+        format=file_fmt,
+        level="DEBUG",
+        encoding="utf-8",
+        enqueue=True,  # thread-safe writes
+        backtrace=True,  # full tracebacks on exceptions
+        diagnose=True,
+    )
+
+    logger.info(f"Log file: '{log_path}'")
+    return log_path
+
 
 # ---------------------------------------------------------------------------
 # Helper utilities
@@ -148,19 +200,12 @@ def denormalize(kp, w, h):
 
 
 def compute_distances(gt, pred, vis_mask):
-    """Per-keypoint Euclidean distance in pixels. NaN for invisible keypoints."""
     dist = np.linalg.norm(gt - pred, axis=1)
     dist[vis_mask == 0] = np.nan
     return dist
 
 
 def compute_bbox_scale(gt_kp_px, vis_mask):
-    """
-    Bounding-box scale = sqrt(bbox_w * bbox_h) from visible GT keypoints.
-
-    Returns 0.0 if fewer than 2 keypoints are visible (scale undefined).
-    Used as fallback when torso landmarks are not available.
-    """
     visible = gt_kp_px[vis_mask > 0]
     if len(visible) < 2:
         return 0.0
@@ -171,17 +216,6 @@ def compute_bbox_scale(gt_kp_px, vis_mask):
 
 
 def compute_torso_scale(gt_kp_px, vis_mask):
-    """
-    Torso scale = mean length of shoulder→opposite-hip diagonals.
-
-    Uses pairs (L.Shoulder→R.Hip) and (R.Shoulder→L.Hip).  At least one pair
-    must have both landmarks visible; otherwise returns 0.0.
-
-    Preferred over bbox scale because it is body-proportional regardless of
-    which body parts are in frame.  A person cropped at the waist still gives a
-    meaningful torso scale, whereas the bbox would shrink to the upper-body
-    extent and inflate the normalised error.
-    """
     lengths = []
     for a, b in TORSO_PAIRS:
         if vis_mask[a] > 0 and vis_mask[b] > 0:
@@ -190,18 +224,6 @@ def compute_torso_scale(gt_kp_px, vis_mask):
 
 
 def compute_scale(gt_kp_px, vis_mask):
-    """
-    Dual-scale strategy (torso preferred, bbox as fallback).
-
-    1. Try torso scale (shoulder↔opposite-hip diagonal).
-    2. If torso keypoints are occluded, fall back to bbox scale.
-    3. If neither is available, return 0.0 (frame will be excluded from
-       normalised metrics).
-
-    This prevents partial-visibility frames from inflating normalised error:
-    when only the upper body is visible the GT bbox is small, which would
-    incorrectly amplify every normalised distance by a large factor.
-    """
     scale = compute_torso_scale(gt_kp_px, vis_mask)
     if scale <= 0:
         scale = compute_bbox_scale(gt_kp_px, vis_mask)
@@ -209,36 +231,12 @@ def compute_scale(gt_kp_px, vis_mask):
 
 
 def compute_normalized_distances(dist_px, scale):
-    """
-    Divide pixel distances by a body-proportional scale.
-
-    PCK@0.2 definition: keypoint is *correct* when
-        dist_px / scale  <  0.2
-    i.e. the error is less than 20 % of sqrt(bbox_w × bbox_h) or the
-    torso diagonal — whichever scale was used.
-
-    Returns NaN for entries where dist_px is already NaN (invisible keypoints)
-    or where scale == 0 (scale could not be computed for this frame).
-    """
     if scale <= 0:
         return np.full_like(dist_px, np.nan)
     return dist_px / scale
 
 
 def compute_oks(dist_px, scale, vis_mask, sigmas=COCO_KP_SIGMAS):
-    """
-    Per-keypoint Object Keypoint Similarity (simplified COCO formulation):
-
-        OKS_i = exp( -d_i² / (2 · (scale · σ_i)²) )
-
-    where σ_i are the per-keypoint constants from the COCO paper (Table 1),
-    encoding how much natural variation exists for each landmark type.
-    Harder-to-localise joints (wrists, ankles) have larger σ, so the same
-    pixel error contributes a smaller OKS penalty.
-
-    Returns NaN for invisible or invalid keypoints.
-    Returns an all-NaN array if scale == 0.
-    """
     if scale <= 0:
         return np.full(17, np.nan)
     oks = np.full(17, np.nan)
@@ -251,22 +249,11 @@ def compute_oks(dist_px, scale, vis_mask, sigmas=COCO_KP_SIGMAS):
 
 
 # ---------------------------------------------------------------------------
-# Shared PCK helper  (eliminates duplicate threshold-loop logic)
+# Shared PCK helper
 # ---------------------------------------------------------------------------
 
 
 def _pck(distances_flat, threshold):
-    """
-    Fraction (0–100) of valid keypoints whose distance ≤ threshold.
-
-    Parameters
-    ----------
-    distances_flat : 1-D array, may contain NaN (invisible / no-scale frames)
-    threshold      : scalar — pixel value OR normalised fraction depending on
-                     which distance array is passed
-
-    Returns 0.0 if no valid entries exist (numerical safety).
-    """
     valid = distances_flat[~np.isnan(distances_flat)]
     if len(valid) == 0:
         return 0.0
@@ -274,37 +261,17 @@ def _pck(distances_flat, threshold):
 
 
 # ---------------------------------------------------------------------------
-# OKS threshold metrics  (OKS@0.5 and OKS@0.75)
+# OKS threshold metrics
 # ---------------------------------------------------------------------------
 
 
 def compute_oks_thresholds(all_oks, thresholds=(0.5, 0.75)):
-    """
-    OKS@t = percentage of valid keypoints with OKS > t.
-
-    This mirrors AP@[.5:.95] used in COCO evaluation and provides a
-    meaningful difficulty gradient: OKS@0.5 is a loose correctness criterion
-    (roughly comparable to a 50 % match), while OKS@0.75 is strict.
-
-    Parameters
-    ----------
-    all_oks     : (N, 17) array, NaN for invisible / no-scale keypoints
-    thresholds  : iterable of OKS thresholds to evaluate
-
-    Returns
-    -------
-    dict  {threshold: percentage}   e.g. {0.5: 84.3, 0.75: 61.7}
-    Also returns per-keypoint breakdown as a second dict.
-    """
     flat = all_oks.flatten()
     valid = flat[~np.isnan(flat)]
 
     global_oks_t = {}
     for t in thresholds:
-        if len(valid) == 0:
-            global_oks_t[t] = 0.0
-        else:
-            global_oks_t[t] = float(np.mean(valid > t) * 100)
+        global_oks_t[t] = float(np.mean(valid > t) * 100) if len(valid) > 0 else 0.0
 
     per_kp_oks_t = {t: [] for t in thresholds}
     for i in range(17):
@@ -322,35 +289,9 @@ def compute_oks_thresholds(all_oks, thresholds=(0.5, 0.75)):
 
 
 def compute_visibility_mae(all_distances_px, all_gt_vis):
-    """
-    Split MAE into visible vs occluded keypoints.
-
-    Assumptions
-    -----------
-    * A keypoint is *visible*   if gt_vis > 0.5  (GT visibility flag set)
-    * A keypoint is *occluded*  if gt_vis == 0    (GT visibility flag unset)
-    * NaN entries in all_distances_px mean the keypoint was invisible and
-      was already excluded from pixel-distance computation; they are skipped.
-
-    Note: If the dataset only annotates fully-visible keypoints (gt_vis is
-    always 1 for labelled joints), the occluded MAE will be NaN, which is
-    reported explicitly rather than silently omitted.
-
-    Parameters
-    ----------
-    all_distances_px : (N, 17) pixel-distance array (NaN = invisible)
-    all_gt_vis       : (N, 17) visibility flags in {0, 1}  (or float 0/1)
-
-    Returns
-    -------
-    mae_visible   : float or NaN
-    mae_occluded  : float or NaN
-    n_visible     : int — number of valid visible keypoint observations
-    n_occluded    : int — number of valid occluded keypoint observations
-    """
-    vis_mask = all_gt_vis > 0.5  # (N,17) bool
-    occ_mask = all_gt_vis == 0  # (N,17) bool
-    valid = ~np.isnan(all_distances_px)  # (N,17) bool
+    vis_mask = all_gt_vis > 0.5
+    occ_mask = all_gt_vis == 0
+    valid = ~np.isnan(all_distances_px)
 
     vis_dists = all_distances_px[vis_mask & valid]
     occ_dists = all_distances_px[occ_mask & valid]
@@ -362,21 +303,16 @@ def compute_visibility_mae(all_distances_px, all_gt_vis):
 
 
 # ---------------------------------------------------------------------------
-# Per-keypoint statistics (extended to handle normalised distances)
+# Per-keypoint statistics
 # ---------------------------------------------------------------------------
 
 
 def _compute_per_kp_stats(all_distances, all_norm_distances=None):
-    """
-    Compute per-keypoint statistics for both pixel and (optionally) normalised
-    distances.  Returns a dict with list-of-17 entries.
-    """
     n_kp = 17
     n_samples = all_distances.shape[0]
     keys = ["mae", "median", "p25", "p75", "p95", "max", "valid_pct", "pck20px"]
     stats = {k: [] for k in keys}
 
-    # Normalised stats (if provided)
     if all_norm_distances is not None:
         for k in ["norm_mae", "norm_median", "pck01", "pck02"]:
             stats[k] = []
@@ -428,12 +364,12 @@ def _save(fname, out_dir):
     path = os.path.join(out_dir, fname)
     plt.tight_layout()
     plt.savefig(path, dpi=180, bbox_inches="tight")
-    print(f"[INFO] Saved: '{path}'")
+    logger.info(f"Saved plot: '{path}'")
     plt.close()
 
 
 # ---------------------------------------------------------------------------
-# Plot 01 — Global Metrics (extended with normalised + detection rate + OKS)
+# Plot 01 — Global Metrics
 # ---------------------------------------------------------------------------
 
 
@@ -448,16 +384,6 @@ def plot_global_metrics(
     mae_occluded,
     out_dir=".",
 ):
-    """
-    Summary card panel.  Normalised metrics are PRIMARY; pixel metrics secondary.
-
-    Parameters
-    ----------
-    valid_frames          : frames where the image loaded successfully
-    missing_detections    : frames where the model returned no pose
-    oks_thresholds_global : dict {0.5: pct, 0.75: pct} from compute_oks_thresholds
-    mae_visible / mae_occluded : from compute_visibility_mae
-    """
     mae = np.nanmean(all_distances)
     rmse = np.sqrt(np.nanmean(all_distances**2))
     norm_mae = np.nanmean(all_norm_distances)
@@ -465,9 +391,6 @@ def plot_global_metrics(
     mean_oks = np.nanmean(all_oks)
 
     n_evaluated = len(all_distances)
-    # Denominator is valid_frames (images that loaded OK), not total_frames.
-    # Unreadable image files are neither detected nor missed — they are
-    # excluded from the denominator to avoid penalising the model for I/O errors.
     det_rate = n_evaluated / valid_frames * 100 if valid_frames > 0 else 0.0
     miss_rate = missing_detections / valid_frames * 100 if valid_frames > 0 else 0.0
 
@@ -492,7 +415,6 @@ def plot_global_metrics(
     ax.set_title("Global Metrics", fontsize=13, fontweight="bold", pad=10)
 
     sections = [
-        # (label, value, colour, is_separator)
         ("── Primary (Normalised) ──", "", "#888888", True),
         ("Normalised MAE", f"{norm_mae:.4f}", "#5C85D6", False),
         ("Normalised RMSE", f"{norm_rmse:.4f}", "#5C85D6", False),
@@ -555,7 +477,7 @@ def plot_global_metrics(
     plt.savefig(
         os.path.join(out_dir, "01_global_metrics.png"), dpi=180, bbox_inches="tight"
     )
-    print(f"[INFO] Saved: '{os.path.join(out_dir, '01_global_metrics.png')}'")
+    logger.info(f"Saved plot: '{os.path.join(out_dir, '01_global_metrics.png')}'")
     plt.close()
 
 
@@ -567,16 +489,6 @@ def plot_global_metrics(
 def plot_pck_normalized(
     all_norm_distances, thresholds=(0.05, 0.1, 0.15, 0.2, 0.25, 0.3), out_dir="."
 ):
-    """
-    PCK bar chart using normalised distances.
-
-    PCK@t definition: keypoint is *correct* iff
-        dist_px / scale  <  t
-    where scale = torso scale (preferred) or bbox scale (fallback).
-
-    PCK@0.1 and PCK@0.2 are the headline metrics, matching Yang & Ramanan
-    (2013) and the LSP / MPII benchmark protocols.
-    """
     flat = all_norm_distances.flatten()
     pck_vals = [_pck(flat, t) for t in thresholds]
     bar_colors = plt.cm.viridis(np.linspace(0.2, 0.85, len(thresholds)))
@@ -613,17 +525,15 @@ def plot_pck_normalized(
     ax.yaxis.set_major_formatter(ticker.FormatStrFormatter("%.0f%%"))
     ax.grid(axis="y", **_GRID)
     ax.set_facecolor("#FAFAFA")
-
     _save("02_pck_normalized.png", out_dir)
 
 
 # ---------------------------------------------------------------------------
-# Plot 02b — PCK@20px (pixel, kept as supplementary reference)
+# Plot 02b — PCK@20px (pixel, supplementary)
 # ---------------------------------------------------------------------------
 
 
 def plot_pck_pixel(all_distances, thresholds=(10, 20, 30), out_dir="."):
-    """Pixel-based PCK kept as supplementary only."""
     flat = all_distances.flatten()
     pck_vals = [_pck(flat, t) for t in thresholds]
     bar_colors = ["#5C85D6", "#5BAD72", "#E07B4F"]
@@ -650,8 +560,7 @@ def plot_pck_pixel(all_distances, thresholds=(10, 20, 30), out_dir="."):
     ax.set_ylim(0, 115)
     ax.set_ylabel("PCK (%)", fontsize=9)
     ax.set_title(
-        "PCK (Pixel) — SUPPLEMENTARY ONLY\n"
-        "Not scale-invariant; do not use as primary metric",
+        "PCK (Pixel) — SUPPLEMENTARY ONLY\nNot scale-invariant; do not use as primary metric",
         fontsize=10,
         fontweight="bold",
         pad=8,
@@ -660,7 +569,6 @@ def plot_pck_pixel(all_distances, thresholds=(10, 20, 30), out_dir="."):
     ax.yaxis.set_major_formatter(ticker.FormatStrFormatter("%.0f%%"))
     ax.grid(axis="y", **_GRID)
     ax.set_facecolor("#FAFAFA")
-
     _save("02b_pck_pixel_supplementary.png", out_dir)
 
 
@@ -670,10 +578,6 @@ def plot_pck_pixel(all_distances, thresholds=(10, 20, 30), out_dir="."):
 
 
 def plot_error_histogram_dual(all_distances, all_norm_distances, out_dir="."):
-    """
-    Side-by-side histograms so reviewers can directly compare pixel vs
-    normalised distributions.
-    """
     fig, axes = plt.subplots(1, 2, figsize=(12, 4.5), **_STYLE)
 
     for ax, data, xlabel, title, color in [
@@ -782,7 +686,7 @@ def plot_error_cdf_dual(all_distances, all_norm_distances, out_dir="."):
 
 
 def plot_norm_mae_per_keypoint(all_norm_distances, out_dir="."):
-    stats = _compute_per_kp_stats(all_norm_distances)  # reuse generic helper
+    stats = _compute_per_kp_stats(all_norm_distances)
     colors = [_kp_group_color(i) for i in range(17)]
     y_pos = np.arange(17)
 
@@ -810,14 +714,17 @@ def plot_norm_mae_per_keypoint(all_norm_distances, out_dir="."):
     ax.invert_yaxis()
     ax.grid(axis="x", **_GRID)
     ax.set_facecolor("#FAFAFA")
-    for grp, c in GROUP_COLORS.items():
-        ax.barh([], [], color=c, label=grp)
-    ax.legend(loc="lower right", fontsize=9, framealpha=0.85)
+
+    legend_handles = [
+        mpatches.Patch(color=c, label=grp) for grp, c in GROUP_COLORS.items()
+    ]
+    ax.legend(handles=legend_handles, loc="lower right", fontsize=9, framealpha=0.85)
+
     _save("05_norm_mae_per_keypoint.png", out_dir)
 
 
 # ---------------------------------------------------------------------------
-# Plot 05b — Pixel MAE per keypoint (supplementary, unchanged from v1)
+# Plot 05b — Pixel MAE per keypoint (supplementary)
 # ---------------------------------------------------------------------------
 
 
@@ -851,14 +758,17 @@ def plot_mae_per_keypoint(all_distances, out_dir="."):
     ax.invert_yaxis()
     ax.grid(axis="x", **_GRID)
     ax.set_facecolor("#FAFAFA")
-    for grp, c in GROUP_COLORS.items():
-        ax.barh([], [], color=c, label=grp)
-    ax.legend(loc="lower right", fontsize=9, framealpha=0.85)
+
+    legend_handles = [
+        mpatches.Patch(color=c, label=grp) for grp, c in GROUP_COLORS.items()
+    ]
+    ax.legend(handles=legend_handles, loc="lower right", fontsize=9, framealpha=0.85)
+
     _save("05b_pixel_mae_per_keypoint_supplementary.png", out_dir)
 
 
 # ---------------------------------------------------------------------------
-# Plot 06 — Boxplot per keypoint (unchanged from v1)
+# Plot 06 — Boxplot per keypoint
 # ---------------------------------------------------------------------------
 
 
@@ -899,20 +809,11 @@ def plot_boxplot_per_keypoint(all_distances, out_dir="."):
 
 
 # ---------------------------------------------------------------------------
-# Plot 07 — PCK@0.2 per keypoint (normalised, PRIMARY; replaces PCK@20px)
+# Plot 07 — PCK@0.2 per keypoint (normalised, PRIMARY)
 # ---------------------------------------------------------------------------
 
 
 def plot_pck02_per_keypoint(all_norm_distances, out_dir="."):
-    """
-    PCK@0.2 using normalised distances.  A keypoint is correct if its
-    normalised error < 0.2.  This replaces the old PCK@20px plot.
-    """
-    stats = _compute_per_kp_stats(all_norm_distances)
-    y_pos = np.arange(17)
-
-    # Use pck "pck20px" slot which now holds pck@0.2 because we pass norm distances
-    # Recompute explicitly for clarity
     pck02 = []
     for i in range(17):
         col = all_norm_distances[:, i]
@@ -920,6 +821,7 @@ def plot_pck02_per_keypoint(all_norm_distances, out_dir="."):
         pck02.append(np.mean(valid <= 0.2) * 100 if len(valid) > 0 else 0.0)
 
     pck_colors = plt.cm.RdYlGn(np.array(pck02) / 100)
+    y_pos = np.arange(17)
 
     fig, ax = plt.subplots(figsize=(9, 7), **_STYLE)
     bars = ax.barh(
@@ -951,7 +853,7 @@ def plot_pck02_per_keypoint(all_norm_distances, out_dir="."):
 
 
 # ---------------------------------------------------------------------------
-# Plot 08 — Extended stats table (normalised + pixel)
+# Plot 08 — Extended stats table
 # ---------------------------------------------------------------------------
 
 
@@ -1012,7 +914,7 @@ def plot_stats_table(all_distances, all_norm_distances, out_dir="."):
             if j <= 1:
                 cell.set_facecolor(grp_color + base_alpha)
                 cell.set_text_props(color=grp_color, fontweight="bold")
-            elif j <= 4:  # normalised primary columns — slight highlight
+            elif j <= 4:
                 cell.set_facecolor("#EDF3FC" if i % 2 == 0 else "#DDE9F7")
             else:
                 cell.set_facecolor("#F4F4F4" if i % 2 == 0 else "#ECECEC")
@@ -1021,7 +923,7 @@ def plot_stats_table(all_distances, all_norm_distances, out_dir="."):
 
 
 # ---------------------------------------------------------------------------
-# Plot 09 — Group MAE P75 (extended with normalised version)
+# Plot 09 — Group MAE P75
 # ---------------------------------------------------------------------------
 
 
@@ -1093,7 +995,7 @@ def plot_group_mae_p75(all_distances, all_norm_distances, out_dir="."):
 
 
 # ---------------------------------------------------------------------------
-# Plot 10 — Group violin (unchanged, pixel)
+# Plot 10 — Group violin
 # ---------------------------------------------------------------------------
 
 
@@ -1198,9 +1100,12 @@ def plot_oks_per_keypoint(all_oks, out_dir="."):
     ax.axvline(0.5, color="#555555", lw=1, ls="--", alpha=0.6)
     ax.grid(axis="x", **_GRID)
     ax.set_facecolor("#FAFAFA")
-    for grp, c in GROUP_COLORS.items():
-        ax.barh([], [], color=c, label=grp)
-    ax.legend(loc="lower right", fontsize=9, framealpha=0.85)
+
+    legend_handles = [
+        mpatches.Patch(color=c, label=grp) for grp, c in GROUP_COLORS.items()
+    ]
+    ax.legend(handles=legend_handles, loc="lower right", fontsize=9, framealpha=0.85)
+
     _save("12_oks_per_keypoint.png", out_dir)
 
 
@@ -1210,17 +1115,8 @@ def plot_oks_per_keypoint(all_oks, out_dir="."):
 
 
 def plot_oks_thresholds_per_keypoint(per_kp_oks_t, out_dir="."):
-    """
-    Side-by-side bar charts showing OKS@0.5 and OKS@0.75 per keypoint.
-
-    OKS@t = % of valid keypoints with OKS > t.
-    OKS@0.5  is the standard "easy" threshold (COCO AP@.50).
-    OKS@0.75 is the "strict" threshold (COCO AP@.75).
-    Comparing the two reveals which keypoints degrade most under tight criteria.
-    """
     thresholds = sorted(per_kp_oks_t.keys())
     y_pos = np.arange(17)
-    colors = [_kp_group_color(i) for i in range(17)]
 
     fig, axes = plt.subplots(
         1, len(thresholds), figsize=(9 * len(thresholds), 7), **_STYLE
@@ -1261,415 +1157,336 @@ def plot_oks_thresholds_per_keypoint(per_kp_oks_t, out_dir="."):
 
 
 # ---------------------------------------------------------------------------
-# Data printing utility functions
+# Data logging functions  (print_* → log_*)
 # ---------------------------------------------------------------------------
 
 
-def print_pck_normalized_data(
+def log_pck_normalized_data(
     all_norm_distances, thresholds=(0.05, 0.1, 0.15, 0.2, 0.25, 0.3)
 ):
-    """Print PCK normalized data to console"""
     flat = all_norm_distances.flatten()
     pck_vals = [_pck(flat, t) for t in thresholds]
 
-    print("\n" + "=" * 80)
-    print("PCK NORMALIZED DATA (PRIMARY METRIC)")
-    print("=" * 80)
-    print("PCK@t definition: keypoint is *correct* iff dist_px / scale < t")
-    print("where scale = torso scale (preferred) or bbox scale (fallback)\n")
-
-    print("Threshold\tPCK (%)")
-    print("-" * 30)
+    logger.info(_SEP)
+    logger.info("PCK NORMALIZED DATA (PRIMARY METRIC)")
+    logger.info(_SEP)
+    logger.info("PCK@t: keypoint is *correct* iff dist_px / scale < t")
+    logger.info("scale = torso scale (preferred) or bbox scale (fallback)")
+    logger.info("")
+    logger.info(f"{'Threshold':<12} {'PCK (%)'}")
+    logger.info(_SEP_THIN[:30])
     for t, val in zip(thresholds, pck_vals):
-        print(f"{t:.3f}\t\t{val:.1f}%")
+        logger.info(f"{t:<12.3f} {val:.1f}%")
+    logger.info("")
+    logger.info(f"  PCK@0.1 : {pck_vals[1]:.1f}%  — Standard evaluation threshold")
+    logger.info(f"  PCK@0.2 : {pck_vals[3]:.1f}%  — Common benchmark threshold")
+    logger.info(_SEP)
 
-    print("\nKey thresholds:")
-    print(f"PCK@0.1: {pck_vals[1]:.1f}% - Standard evaluation threshold")
-    print(f"PCK@0.2: {pck_vals[3]:.1f}% - Common benchmark threshold")
-    print("=" * 80)
 
-
-def print_pck_pixel_data(all_distances, thresholds=(10, 20, 30)):
-    """Print PCK pixel data to console"""
+def log_pck_pixel_data(all_distances, thresholds=(10, 20, 30)):
     flat = all_distances.flatten()
     pck_vals = [_pck(flat, t) for t in thresholds]
 
-    print("\n" + "=" * 80)
-    print("PCK PIXEL DATA (SUPPLEMENTARY ONLY)")
-    print("=" * 80)
-    print("Note: Not scale-invariant; do not use as primary metric\n")
-
-    print("Threshold\tPCK (%)")
-    print("-" * 30)
+    logger.info(_SEP)
+    logger.info("PCK PIXEL DATA (SUPPLEMENTARY ONLY — not scale-invariant)")
+    logger.info(_SEP)
+    logger.info(f"{'Threshold':<12} {'PCK (%)'}")
+    logger.info(_SEP_THIN[:30])
     for t, val in zip(thresholds, pck_vals):
-        print(f"{t}px\t\t{val:.1f}%")
-    print("=" * 80)
+        logger.info(f"{t}px{'':8} {val:.1f}%")
+    logger.info(_SEP)
 
 
-def print_error_distribution_data(all_distances, all_norm_dimensions):
-    """Print error distribution statistics"""
-    print("\n" + "=" * 80)
-    print("ERROR DISTRIBUTION STATISTICS")
-    print("=" * 80)
-
+def log_error_distribution_data(all_distances, all_norm_distances):
+    logger.info(_SEP)
+    logger.info("ERROR DISTRIBUTION STATISTICS")
+    logger.info(_SEP)
     for name, data in [
         ("Pixel Error", all_distances),
-        ("Normalized Error", all_norm_dimensions),
+        ("Normalized Error", all_norm_distances),
     ]:
         flat = data.flatten()
         flat = flat[~np.isnan(flat)]
-
-        print(f"\n{name}:")
-        print(f"  Mean (MAE): {np.mean(flat):.4f}")
-        print(f"  Median: {np.median(flat):.4f}")
-        print(f"  Std Dev: {np.std(flat):.4f}")
-        print(f"  25th Percentile: {np.percentile(flat, 25):.4f}")
-        print(f"  75th Percentile: {np.percentile(flat, 75):.4f}")
-        print(f"  95th Percentile: {np.percentile(flat, 95):.4f}")
-        print(f"  Max: {np.max(flat):.4f}")
-        print(f"  Valid samples: {len(flat)}")
-
-    print("=" * 80)
+        logger.info(f"{name}:")
+        logger.info(f"  Mean (MAE)      : {np.mean(flat):.4f}")
+        logger.info(f"  Median          : {np.median(flat):.4f}")
+        logger.info(f"  Std Dev         : {np.std(flat):.4f}")
+        logger.info(f"  25th Percentile : {np.percentile(flat, 25):.4f}")
+        logger.info(f"  75th Percentile : {np.percentile(flat, 75):.4f}")
+        logger.info(f"  95th Percentile : {np.percentile(flat, 95):.4f}")
+        logger.info(f"  Max             : {np.max(flat):.4f}")
+        logger.info(f"  Valid samples   : {len(flat)}")
+    logger.info(_SEP)
 
 
-def print_norm_mae_per_keypoint_data(all_norm_distances):
-    """Print normalized MAE per keypoint data"""
+def log_norm_mae_per_keypoint_data(all_norm_distances):
     stats = _compute_per_kp_stats(all_norm_distances)
 
-    print("\n" + "=" * 80)
-    print("NORMALIZED MAE PER KEYPOINT (PRIMARY METRIC)")
-    print("=" * 80)
-    print("Divided by √(bbox_w × bbox_h)\n")
-
-    print(
+    logger.info(_SEP)
+    logger.info(
+        "NORMALIZED MAE PER KEYPOINT (PRIMARY)  |  divided by √(bbox_w × bbox_h)"
+    )
+    logger.info(_SEP)
+    logger.info(
         f"{'Keypoint':<15} {'Group':<8} {'Norm.MAE':<10} {'PCK@0.1':<10} {'PCK@0.2':<10}"
     )
-    print("-" * 70)
+    logger.info(_SEP_THIN[:70])
 
+    pck01 = stats.get("pck01", [0.0] * 17)
+    pck02 = stats.get("pck02", [0.0] * 17)
     for i in range(17):
-        kp_name = COCO_NAMES[i]
-        group = _kp_group_name(i)
-        norm_mae = stats["mae"][i]  # Note: stats['mae'] contains normalized MAE here
-        pck01 = stats["pck01"][i] if "pck01" in stats else 0.0
-        pck02 = stats["pck02"][i] if "pck02" in stats else 0.0
+        logger.info(
+            f"{COCO_NAMES[i]:<15} {_kp_group_name(i):<8} "
+            f"{stats['mae'][i]:.4f}   {pck01[i]:.1f}%    {pck02[i]:.1f}%"
+        )
 
-        print(f"{kp_name:<15} {group:<8} {norm_mae:.4f}   {pck01:.1f}%    {pck02:.1f}%")
-
-    print("\nGroup averages:")
-    group_means = {}
+    logger.info("")
+    logger.info("Group averages:")
     for group, indices in BODY_GROUPS.items():
-        group_values = [stats["mae"][i] for i in indices]
-        group_means[group] = np.mean(group_values)
-        print(f"  {group}: {group_means[group]:.4f}")
-
-    print("=" * 80)
+        logger.info(f"  {group}: {np.mean([stats['mae'][i] for i in indices]):.4f}")
+    logger.info(_SEP)
 
 
-def print_mae_per_keypoint_data(all_distances):
-    """Print pixel MAE per keypoint data"""
+def log_mae_per_keypoint_data(all_distances):
     stats = _compute_per_kp_stats(all_distances)
 
-    print("\n" + "=" * 80)
-    print("PIXEL MAE PER KEYPOINT (SUPPLEMENTARY)")
-    print("=" * 80)
-
-    print(
-        f"{'Keypoint':<15} {'Group':<8} {'MAE (px)':<10} {'Median (px)':<12} {'PCK@20px':<10}"
+    logger.info(_SEP)
+    logger.info("PIXEL MAE PER KEYPOINT (SUPPLEMENTARY)")
+    logger.info(_SEP)
+    logger.info(
+        f"{'Keypoint':<15} {'Group':<8} {'MAE (px)':<10} "
+        f"{'Median (px)':<12} {'PCK@20px':<10}"
     )
-    print("-" * 70)
-
+    logger.info(_SEP_THIN[:70])
     for i in range(17):
-        kp_name = COCO_NAMES[i]
-        group = _kp_group_name(i)
-        mae = stats["mae"][i]
-        median = stats["median"][i]
-        pck20 = stats["pck20px"][i]
-
-        print(f"{kp_name:<15} {group:<8} {mae:.2f}     {median:.2f}       {pck20:.1f}%")
-
-    print("\nGroup averages (pixel MAE):")
-    group_means = {}
+        logger.info(
+            f"{COCO_NAMES[i]:<15} {_kp_group_name(i):<8} "
+            f"{stats['mae'][i]:.2f}     {stats['median'][i]:.2f}       "
+            f"{stats['pck20px'][i]:.1f}%"
+        )
+    logger.info("")
+    logger.info("Group averages (pixel MAE):")
     for group, indices in BODY_GROUPS.items():
-        group_values = [stats["mae"][i] for i in indices]
-        group_means[group] = np.mean(group_values)
-        print(f"  {group}: {group_means[group]:.2f}px")
-
-    print("=" * 80)
+        logger.info(f"  {group}: {np.mean([stats['mae'][i] for i in indices]):.2f}px")
+    logger.info(_SEP)
 
 
-def print_boxplot_statistics(all_distances):
-    """Print boxplot statistics per keypoint"""
-    print("\n" + "=" * 80)
-    print("BOXPLOT STATISTICS PER KEYPOINT (PIXEL ERROR)")
-    print("=" * 80)
-
-    print(
-        f"{'Keypoint':<15} {'Group':<8} {'Min':<8} {'Q1':<8} {'Median':<8} {'Q3':<8} {'Max':<8} {'IQR':<8}"
+def log_boxplot_statistics(all_distances):
+    logger.info(_SEP)
+    logger.info("BOXPLOT STATISTICS PER KEYPOINT (PIXEL ERROR)")
+    logger.info(_SEP)
+    logger.info(
+        f"{'Keypoint':<15} {'Group':<8} {'Min':<8} {'Q1':<8} "
+        f"{'Median':<8} {'Q3':<8} {'Max':<8} {'IQR':<8}"
     )
-    print("-" * 85)
-
+    logger.info(_SEP_THIN[:85])
     for i in range(17):
         col = all_distances[:, i]
         valid = col[~np.isnan(col)]
-
         if len(valid) > 0:
-            min_val = np.min(valid)
-            q1 = np.percentile(valid, 25)
-            median = np.median(valid)
-            q3 = np.percentile(valid, 75)
-            max_val = np.max(valid)
-            iqr = q3 - q1
-
-            print(
-                f"{COCO_NAMES[i]:<15} {_kp_group_name(i):<8} {min_val:.2f}  {q1:.2f}  {median:.2f}  {q3:.2f}  {max_val:.2f}  {iqr:.2f}"
+            q1, q3 = np.percentile(valid, 25), np.percentile(valid, 75)
+            logger.info(
+                f"{COCO_NAMES[i]:<15} {_kp_group_name(i):<8} "
+                f"{np.min(valid):.2f}  {q1:.2f}  {np.median(valid):.2f}  "
+                f"{q3:.2f}  {np.max(valid):.2f}  {q3 - q1:.2f}"
             )
         else:
-            print(f"{COCO_NAMES[i]:<15} {_kp_group_name(i):<8} No valid data")
+            logger.warning(f"{COCO_NAMES[i]:<15} {_kp_group_name(i):<8} No valid data")
+    logger.info(_SEP)
 
-    print("=" * 80)
 
-
-def print_pck02_per_keypoint_data(all_norm_distances):
-    """Print PCK@0.2 per keypoint data"""
-    print("\n" + "=" * 80)
-    print("PCK@0.2 (NORMALIZED) PER KEYPOINT (PRIMARY METRIC)")
-    print("=" * 80)
-    print("Definition: keypoint is correct if normalized error < 0.2\n")
-
-    print(f"{'Keypoint':<15} {'Group':<8} {'PCK@0.2 (%)':<12} {'Norm.MAE':<10}")
-    print("-" * 60)
-
+def log_pck02_per_keypoint_data(all_norm_distances):
     stats = _compute_per_kp_stats(all_norm_distances)
 
+    logger.info(_SEP)
+    logger.info("PCK@0.2 (NORMALIZED) PER KEYPOINT (PRIMARY)  |  error < 0.2 = correct")
+    logger.info(_SEP)
+    logger.info(f"{'Keypoint':<15} {'Group':<8} {'PCK@0.2 (%)':<12} {'Norm.MAE':<10}")
+    logger.info(_SEP_THIN[:60])
+
+    group_pck02: dict[str, list] = {g: [] for g in BODY_GROUPS}
     for i in range(17):
-        kp_name = COCO_NAMES[i]
-        group = _kp_group_name(i)
         col = all_norm_distances[:, i]
         valid = col[~np.isnan(col)]
-
         if len(valid) > 0:
             pck02 = np.mean(valid <= 0.2) * 100
-            norm_mae = stats["mae"][i]
-            print(f"{kp_name:<15} {group:<8} {pck02:.1f}%     {norm_mae:.4f}")
+            grp = _kp_group_name(i)
+            if grp in group_pck02:
+                group_pck02[grp].append(pck02)
+            logger.info(
+                f"{COCO_NAMES[i]:<15} {grp:<8} {pck02:.1f}%     {stats['mae'][i]:.4f}"
+            )
         else:
-            print(f"{kp_name:<15} {group:<8} No valid data")
+            logger.warning(f"{COCO_NAMES[i]:<15} {_kp_group_name(i):<8} No valid data")
 
-    # Group averages
-    print("\nGroup averages (PCK@0.2):")
-    group_pck02 = {}
-    for group, indices in BODY_GROUPS.items():
-        group_values = []
-        for i in indices:
-            col = all_norm_distances[:, i]
-            valid = col[~np.isnan(col)]
-            if len(valid) > 0:
-                group_values.append(np.mean(valid <= 0.2) * 100)
-        if group_values:
-            group_pck02[group] = np.mean(group_values)
-            print(f"  {group}: {group_pck02[group]:.1f}%")
-
-    print("=" * 80)
+    logger.info("")
+    logger.info("Group averages (PCK@0.2):")
+    for group, vals in group_pck02.items():
+        if vals:
+            logger.info(f"  {group}: {np.mean(vals):.1f}%")
+    logger.info(_SEP)
 
 
-def print_stats_table_data(all_distances, all_norm_distances):
-    """Print comprehensive statistics table data"""
+def log_stats_table_data(all_distances, all_norm_distances):
     stats = _compute_per_kp_stats(all_distances, all_norm_distances)
 
-    print("\n" + "=" * 80)
-    print("COMPREHENSIVE STATISTICS TABLE")
-    print("=" * 80)
-    print("▲ = primary normalized metrics\n")
-
-    header = f"{'Keypoint':<15} {'Group':<8} {'Norm.MAE▲':<10} {'PCK@0.1▲':<10} {'PCK@0.2▲':<10} {'Pixel MAE':<10} {'Valid%':<8}"
-    print(header)
-    print("-" * len(header))
-
+    logger.info(_SEP)
+    logger.info("COMPREHENSIVE STATISTICS TABLE  (▲ = primary normalized metrics)")
+    logger.info(_SEP)
+    header = (
+        f"{'Keypoint':<15} {'Group':<8} {'Norm.MAE▲':<10} "
+        f"{'PCK@0.1▲':<10} {'PCK@0.2▲':<10} {'Pixel MAE':<10} {'Valid%':<8}"
+    )
+    logger.info(header)
+    logger.info(_SEP_THIN[: len(header)])
     for i in range(17):
-        line = (
-            f"{COCO_NAMES[i]:<15} "
-            f"{_kp_group_name(i):<8} "
-            f"{stats['norm_mae'][i]:.4f}  "
-            f"{stats['pck01'][i]:.1f}%   "
-            f"{stats['pck02'][i]:.1f}%   "
-            f"{stats['mae'][i]:.2f}px "
+        logger.info(
+            f"{COCO_NAMES[i]:<15} {_kp_group_name(i):<8} "
+            f"{stats['norm_mae'][i]:.4f}    "
+            f"{stats['pck01'][i]:.1f}%    "
+            f"{stats['pck02'][i]:.1f}%    "
+            f"{stats['mae'][i]:.2f}px  "
             f"{stats['valid_pct'][i]:.1f}%"
         )
-        print(line)
-
-    # Summary statistics
-    print("\nSummary Statistics:")
-    print(f"Average Normalized MAE: {np.mean(stats['norm_mae']):.4f}")
-    print(f"Average PCK@0.2 (norm): {np.mean(stats['pck02']):.1f}%")
-    print(f"Average Pixel MAE: {np.mean(stats['mae']):.2f}px")
-    print(f"Average Valid Percentage: {np.mean(stats['valid_pct']):.1f}%")
-
-    print("=" * 80)
+    logger.info("")
+    logger.info(f"  Avg Normalized MAE  : {np.mean(stats['norm_mae']):.4f}")
+    logger.info(f"  Avg PCK@0.2 (norm)  : {np.mean(stats['pck02']):.1f}%")
+    logger.info(f"  Avg Pixel MAE       : {np.mean(stats['mae']):.2f}px")
+    logger.info(f"  Avg Valid %         : {np.mean(stats['valid_pct']):.1f}%")
+    logger.info(_SEP)
 
 
-def print_group_mae_p75_data(all_distances, all_norm_distances):
-    """Print group MAE and P75 data"""
-    print("\n" + "=" * 80)
-    print("BODY GROUP STATISTICS (MAE AND P75)")
-    print("=" * 80)
-
-    print(f"{'Group':<10} {'Metric':<12} {'Pixel':<12} {'Normalized':<12}")
-    print("-" * 60)
-
+def log_group_mae_p75_data(all_distances, all_norm_distances):
+    logger.info(_SEP)
+    logger.info("BODY GROUP STATISTICS — MAE AND P75")
+    logger.info(_SEP)
+    logger.info(f"{'Group':<10} {'Metric':<12} {'Pixel':<12} {'Normalized':<12}")
+    logger.info(_SEP_THIN[:60])
     for group, indices in BODY_GROUPS.items():
-        # Pixel data
-        group_pixel_data = all_distances[:, indices].flatten()
-        group_pixel_data = group_pixel_data[~np.isnan(group_pixel_data)]
-
-        # Normalized data
-        group_norm_data = all_norm_distances[:, indices].flatten()
-        group_norm_data = group_norm_data[~np.isnan(group_norm_data)]
-
-        if len(group_pixel_data) > 0 and len(group_norm_data) > 0:
-            pixel_mae = np.mean(group_pixel_data)
-            pixel_p75 = np.percentile(group_pixel_data, 75)
-            norm_mae = np.mean(group_norm_data)
-            norm_p75 = np.percentile(group_norm_data, 75)
-
-            print(f"{group:<10} {'MAE':<12} {pixel_mae:.2f}px   {norm_mae:.4f}")
-            print(f"{group:<10} {'P75':<12} {pixel_p75:.2f}px   {norm_p75:.4f}")
-            print("-" * 60)
-
-    print("=" * 80)
+        gp = all_distances[:, indices].flatten()
+        gp = gp[~np.isnan(gp)]
+        gn = all_norm_distances[:, indices].flatten()
+        gn = gn[~np.isnan(gn)]
+        if len(gp) > 0 and len(gn) > 0:
+            logger.info(
+                f"{group:<10} {'MAE':<12} {np.mean(gp):.2f}px   {np.mean(gn):.4f}"
+            )
+            logger.info(
+                f"{group:<10} {'P75':<12} {np.percentile(gp, 75):.2f}px   "
+                f"{np.percentile(gn, 75):.4f}"
+            )
+            logger.info(_SEP_THIN[:60])
+    logger.info(_SEP)
 
 
-def print_oks_distribution_data(all_oks):
-    """Print OKS distribution data"""
+def log_oks_distribution_data(all_oks):
     flat = all_oks.flatten()
     flat = flat[~np.isnan(flat)]
 
-    print("\n" + "=" * 80)
-    print("OKS (OBJECT KEYPOINT SIMILARITY) DISTRIBUTION")
-    print("=" * 80)
-
+    logger.info(_SEP)
+    logger.info("OKS (OBJECT KEYPOINT SIMILARITY) DISTRIBUTION")
+    logger.info(_SEP)
     if len(flat) > 0:
-        print(f"Total valid OKS values: {len(flat)}")
-        print(f"Mean OKS: {np.mean(flat):.4f}")
-        print(f"Median OKS: {np.median(flat):.4f}")
-        print(f"Std Dev: {np.std(flat):.4f}")
-        print(f"Min: {np.min(flat):.4f}")
-        print(f"Max: {np.max(flat):.4f}")
-
-        # Percentiles
-        print("\nPercentiles:")
+        logger.info(f"Total valid OKS values : {len(flat)}")
+        logger.info(f"Mean OKS               : {np.mean(flat):.4f}")
+        logger.info(f"Median OKS             : {np.median(flat):.4f}")
+        logger.info(f"Std Dev                : {np.std(flat):.4f}")
+        logger.info(f"Min / Max              : {np.min(flat):.4f} / {np.max(flat):.4f}")
+        logger.info("")
+        logger.info("Percentiles:")
         for p in [10, 25, 50, 75, 90]:
-            print(f"  {p}th percentile: {np.percentile(flat, p):.4f}")
-
-        # OKS thresholds
-        print("\nOKS Threshold Statistics:")
+            logger.info(f"  {p:>3}th : {np.percentile(flat, p):.4f}")
+        logger.info("")
+        logger.info("OKS Threshold Statistics:")
         for threshold in [0.5, 0.6, 0.7, 0.75, 0.8, 0.9]:
-            percentage = np.mean(flat > threshold) * 100
-            print(f"  OKS > {threshold:.2f}: {percentage:.1f}%")
+            logger.info(
+                f"  OKS > {threshold:.2f} : {np.mean(flat > threshold) * 100:.1f}%"
+            )
     else:
-        print("No valid OKS data available")
+        logger.warning("No valid OKS data available")
+    logger.info(_SEP)
 
-    print("=" * 80)
 
-
-def print_oks_per_keypoint_data(all_oks):
-    """Print OKS per keypoint data"""
-    print("\n" + "=" * 80)
-    print("MEAN OKS PER KEYPOINT")
-    print("=" * 80)
-
-    print(
-        f"{'Keypoint':<15} {'Group':<8} {'Mean OKS':<10} {'OKS > 0.5 (%)':<15} {'OKS > 0.75 (%)':<15}"
+def log_oks_per_keypoint_data(all_oks):
+    logger.info(_SEP)
+    logger.info("MEAN OKS PER KEYPOINT")
+    logger.info(_SEP)
+    logger.info(
+        f"{'Keypoint':<15} {'Group':<8} {'Mean OKS':<10} "
+        f"{'OKS > 0.5 (%)':<15} {'OKS > 0.75 (%)':<15}"
     )
-    print("-" * 80)
+    logger.info(_SEP_THIN[:80])
 
+    group_oks: dict[str, list] = {g: [] for g in BODY_GROUPS}
     for i in range(17):
         col = all_oks[:, i]
         valid = col[~np.isnan(col)]
-
         if len(valid) > 0:
-            mean_oks = np.mean(valid)
-            oks50 = np.mean(valid > 0.5) * 100
-            oks75 = np.mean(valid > 0.75) * 100
-            group = _kp_group_name(i)
-
-            print(
-                f"{COCO_NAMES[i]:<15} {group:<8} {mean_oks:.4f}   {oks50:.1f}%       {oks75:.1f}%"
+            mean_v = np.mean(valid)
+            grp = _kp_group_name(i)
+            if grp in group_oks:
+                group_oks[grp].append(mean_v)
+            logger.info(
+                f"{COCO_NAMES[i]:<15} {grp:<8} {mean_v:.4f}   "
+                f"{np.mean(valid > 0.5) * 100:.1f}%       "
+                f"{np.mean(valid > 0.75) * 100:.1f}%"
             )
         else:
-            print(f"{COCO_NAMES[i]:<15} {_kp_group_name(i):<8} No valid data")
+            logger.warning(f"{COCO_NAMES[i]:<15} {_kp_group_name(i):<8} No valid data")
 
-    # Group averages
-    print("\nGroup averages (Mean OKS):")
-    group_oks = {}
-    for group, indices in BODY_GROUPS.items():
-        group_values = []
-        for i in indices:
-            col = all_oks[:, i]
-            valid = col[~np.isnan(col)]
-            if len(valid) > 0:
-                group_values.append(np.mean(valid))
-        if group_values:
-            group_oks[group] = np.mean(group_values)
-            print(f"  {group}: {group_oks[group]:.4f}")
-
-    print("=" * 80)
+    logger.info("")
+    logger.info("Group averages (Mean OKS):")
+    for group, vals in group_oks.items():
+        if vals:
+            logger.info(f"  {group}: {np.mean(vals):.4f}")
+    logger.info(_SEP)
 
 
-def print_oks_thresholds_per_keypoint_data(per_kp_oks_t):
-    """Print OKS thresholds per keypoint data"""
+def log_oks_thresholds_per_keypoint_data(per_kp_oks_t):
     thresholds = sorted(per_kp_oks_t.keys())
 
-    print("\n" + "=" * 80)
-    print("OKS THRESHOLDS PER KEYPOINT")
-    print("=" * 80)
-    print("OKS@t = % of valid keypoints with OKS > t\n")
+    logger.info(_SEP)
+    logger.info("OKS THRESHOLDS PER KEYPOINT  (OKS@t = % of valid KPs with OKS > t)")
+    logger.info(_SEP)
 
-    if len(thresholds) > 0:
+    if thresholds:
         header = f"{'Keypoint':<15} {'Group':<8} "
         for t in thresholds:
             header += f"{'OKS@' + str(t):<12} "
-        print(header)
-        print("-" * len(header))
-
+        logger.info(header)
+        logger.info(_SEP_THIN[: len(header)])
         for i in range(17):
             line = f"{COCO_NAMES[i]:<15} {_kp_group_name(i):<8} "
             for t in thresholds:
-                vals = per_kp_oks_t[t]
-                line += f"{vals[i]:.1f}%      "
-            print(line)
-
-        # Group averages
-        print("\nGroup averages:")
+                line += f"{per_kp_oks_t[t][i]:.1f}%{'':6}"
+            logger.info(line)
+        logger.info("")
+        logger.info("Group averages:")
         for group, indices in BODY_GROUPS.items():
-            print(f"\n{group}:")
+            logger.info(f"  {group}:")
             for t in thresholds:
-                group_vals = [per_kp_oks_t[t][i] for i in indices]
-                group_avg = np.mean(group_vals)
-                print(f"  OKS@{t}: {group_avg:.1f}%")
-
-    print("=" * 80)
+                avg = np.mean([per_kp_oks_t[t][i] for i in indices])
+                logger.info(f"    OKS@{t}: {avg:.1f}%")
+    logger.info(_SEP)
 
 
-def print_cdf_key_points(all_distances, all_norm_distances):
-    """Print CDF key points data"""
-    print("\n" + "=" * 80)
-    print("CDF KEY POINTS (CUMULATIVE DISTRIBUTION FUNCTION)")
-    print("=" * 80)
+def log_cdf_key_points(all_distances, all_norm_distances):
+    logger.info(_SEP)
+    logger.info("CDF KEY POINTS (CUMULATIVE DISTRIBUTION FUNCTION)")
+    logger.info(_SEP)
 
-    configs = [
+    for name, data, thresholds in [
         ("Pixel Error", all_distances, [10, 20, 30]),
         ("Normalized Error", all_norm_distances, [0.1, 0.2, 0.3]),
-    ]
-
-    for name, data, thresholds in configs:
-        print(f"\n{name}:")
+    ]:
+        logger.info(f"{name}:")
         flat = data.flatten()
         flat = flat[~np.isnan(flat)]
         sorted_e = np.sort(flat)
         cdf = np.arange(1, len(sorted_e) + 1) / len(sorted_e)
 
-        print(f"{'Threshold':<12} {'Cumulative %':<15} {'Description':<20}")
-        print("-" * 50)
-
+        logger.info(f"  {'Threshold':<12} {'Cumulative %':<15} Description")
+        logger.info(f"  {_SEP_THIN[:50]}")
         for t in thresholds:
             idx = np.searchsorted(sorted_e, t)
             pct = cdf[min(idx, len(cdf) - 1)] * 100
@@ -1680,16 +1497,16 @@ def print_cdf_key_points(all_distances, all_norm_distances):
                 if t <= 0.2
                 else "Loose threshold"
             )
-            print(f"{t:<12} {pct:.1f}%        {desc}")
-
-        # Additional key points
+            logger.info(f"  {t:<12} {pct:.1f}%{'':9} {desc}")
         for pct_target in [50, 80, 90, 95]:
             idx = int(len(sorted_e) * pct_target / 100)
             if idx < len(sorted_e):
-                value = sorted_e[idx]
-                print(f"{value:<12.3f} {pct_target}%        {pct_target}th percentile")
-
-    print("=" * 80)
+                logger.info(
+                    f"  {sorted_e[idx]:<12.3f} {pct_target}%{'':9} "
+                    f"{pct_target}th percentile"
+                )
+        logger.info("")
+    logger.info(_SEP)
 
 
 # ---------------------------------------------------------------------------
@@ -1699,31 +1516,39 @@ def print_cdf_key_points(all_distances, all_norm_distances):
 
 def main():
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_dir = os.path.join("eval_results", f"mediapipe_{timestamp}")
-    os.makedirs(out_dir, exist_ok=True)
-    print(f"[INFO] Output directory: '{out_dir}'")
+
+    # ── Output directories ───────────────────────────────────────────────────
+    eval_dir = os.path.join("eval_results", f"mediapipe_{timestamp}")
+    log_dir = os.path.join("logs", f"mediapipe_{timestamp}")
+    os.makedirs(eval_dir, exist_ok=True)
+
+    # ── Logging — must be set up before any logger.* calls ───────────────────
+    log_path = setup_logger(log_dir)
+
+    logger.info(f"Eval output directory : '{eval_dir}'")
+    logger.info(f"Log  output directory : '{log_dir}'")
 
     dataset = load_dataset_numpy(YOLO_DATASET_PATH)
     total_frames = len(dataset)
+    logger.info(f"Dataset loaded: {total_frames} frames")
 
     mp_backend = MediaPipeBackend(static_image_mode=True)
     mp_backend.initialize()
+    logger.info("MediaPipe backend initialised")
 
-    all_distances = []
-    all_norm_distances = []
-    all_oks = []
-    all_gt_vis = []  # needed for visibility-aware MAE
+    all_distances: list = []
+    all_norm_distances: list = []
+    all_oks: list = []
+    all_gt_vis: list = []
 
-    invalid_frames = 0  # images that failed to load (I/O errors)
-    missing_detections = 0  # images that loaded but yielded no pose
+    invalid_frames = 0
+    missing_detections = 0
 
     for sample in tqdm(dataset, desc="Evaluating"):
         img = cv2.imread(sample["image_path"])
         if img is None:
-            # Image unreadable — exclude from denominator entirely.
-            # Counting these as misses would penalise the model for disk/path
-            # errors, which is incorrect.
             invalid_frames += 1
+            logger.debug(f"Unreadable image skipped: {sample['image_path']}")
             continue
 
         h, w = img.shape[:2]
@@ -1737,13 +1562,8 @@ def main():
         gt_kp = denormalize(sample["keypoints"], w, h)
         gt_vis = sample["visible"]
 
-        # --- pixel distances (NaN for invisible keypoints) ---
         dist = compute_distances(gt_kp, pred_kp, gt_vis)
-
-        # --- dual-scale: torso preferred, bbox as fallback ---
         scale = compute_scale(gt_kp, gt_vis)
-
-        # --- normalised distances and OKS (NaN when scale == 0) ---
         norm_dist = compute_normalized_distances(dist, scale)
         oks = compute_oks(dist, scale, gt_vis)
 
@@ -1753,7 +1573,7 @@ def main():
         all_gt_vis.append(gt_vis)
 
     if len(all_distances) == 0:
-        print("No samples evaluated.")
+        logger.error("No samples evaluated — aborting.")
         return
 
     all_distances = np.array(all_distances)  # (N, 17)
@@ -1761,83 +1581,82 @@ def main():
     all_oks = np.array(all_oks)  # (N, 17)
     all_gt_vis = np.array(all_gt_vis)  # (N, 17)
 
-    # valid_frames = images that loaded OK (the correct denominator for
-    # detection rate — excludes unreadable files which are an I/O problem,
-    # not a model failure)
     valid_frames = total_frames - invalid_frames
     n_evaluated = len(all_distances)
     det_rate = n_evaluated / valid_frames * 100 if valid_frames > 0 else 0.0
     miss_rate = missing_detections / valid_frames * 100 if valid_frames > 0 else 0.0
 
-    # --- primary normalised metrics ---
+    # ── Primary normalised metrics ────────────────────────────────────────────
     global_nmae = np.nanmean(all_norm_distances)
     global_nrmse = np.sqrt(np.nanmean(all_norm_distances**2))
     flat_norm = all_norm_distances.flatten()
     pck01 = _pck(flat_norm, 0.1)
     pck02 = _pck(flat_norm, 0.2)
 
-    # --- OKS metrics ---
+    # ── OKS metrics ───────────────────────────────────────────────────────────
     mean_oks = np.nanmean(all_oks)
     oks_global, oks_per_kp = compute_oks_thresholds(all_oks, thresholds=(0.50, 0.75))
 
-    # --- visibility-aware MAE ---
+    # ── Visibility-aware MAE ──────────────────────────────────────────────────
     mae_vis, mae_occ, n_vis, n_occ = compute_visibility_mae(all_distances, all_gt_vis)
 
-    # --- supplementary pixel metrics ---
+    # ── Supplementary pixel metrics ───────────────────────────────────────────
     global_mae = np.nanmean(all_distances)
     global_rmse = np.sqrt(np.nanmean(all_distances**2))
 
-    # ---- console summary ----
-    print("\n" + "=" * 60)
-    print(f"  Total frames       : {total_frames}")
-    print(f"  Invalid (I/O err)  : {invalid_frames}")
-    print(f"  Valid frames       : {valid_frames}")
-    print(f"  Missing detections : {missing_detections}  ({miss_rate:.1f}%)")
-    print(f"  Detected           : {n_evaluated}  ({det_rate:.1f}%)")
-    print(f"  --- PRIMARY (Normalised) ---")
-    print(f"  Normalised MAE     : {global_nmae:.4f}")
-    print(f"  Normalised RMSE    : {global_nrmse:.4f}")
-    print(f"  PCK@0.1  (norm)    : {pck01:.1f}%")
-    print(f"  PCK@0.2  (norm)    : {pck02:.1f}%")
-    print(f"  Mean OKS           : {mean_oks:.4f}")
-    print(f"  OKS@0.50           : {oks_global[0.50]:.1f}%")
-    print(f"  OKS@0.75           : {oks_global[0.75]:.1f}%")
-    print(f"  --- Visibility Split (Pixel MAE) ---")
     vis_str = f"{mae_vis:.2f} px  (n={n_vis})" if not np.isnan(mae_vis) else "N/A"
     occ_str = (
         f"{mae_occ:.2f} px  (n={n_occ})"
         if not np.isnan(mae_occ)
         else "N/A (no occluded GT)"
     )
-    print(f"  MAE — Visible      : {vis_str}")
-    print(f"  MAE — Occluded     : {occ_str}")
-    print(f"  --- SUPPLEMENTARY (Pixel) ---")
-    print(f"  Pixel MAE          : {global_mae:.2f} px")
-    print(f"  Pixel RMSE         : {global_rmse:.2f} px")
-    print("=" * 60)
-    print(f"  Results saved to   : '{out_dir}'")
-    print("=" * 60)
 
-    # ---------- plots with data printing ----------
+    # ── Summary ───────────────────────────────────────────────────────────────
+    logger.info("=" * 60)
+    logger.info(f"  Total frames       : {total_frames}")
+    logger.info(f"  Invalid (I/O err)  : {invalid_frames}")
+    logger.info(f"  Valid frames       : {valid_frames}")
+    logger.info(f"  Missing detections : {missing_detections}  ({miss_rate:.1f}%)")
+    logger.info(f"  Detected           : {n_evaluated}  ({det_rate:.1f}%)")
+    logger.info("  --- PRIMARY (Normalised) ---")
+    logger.info(f"  Normalised MAE     : {global_nmae:.4f}")
+    logger.info(f"  Normalised RMSE    : {global_nrmse:.4f}")
+    logger.info(f"  PCK@0.1  (norm)    : {pck01:.1f}%")
+    logger.info(f"  PCK@0.2  (norm)    : {pck02:.1f}%")
+    logger.info(f"  Mean OKS           : {mean_oks:.4f}")
+    logger.info(f"  OKS@0.50           : {oks_global[0.50]:.1f}%")
+    logger.info(f"  OKS@0.75           : {oks_global[0.75]:.1f}%")
+    logger.info("  --- Visibility Split (Pixel MAE) ---")
+    logger.info(f"  MAE — Visible      : {vis_str}")
+    logger.info(f"  MAE — Occluded     : {occ_str}")
+    logger.info("  --- SUPPLEMENTARY (Pixel) ---")
+    logger.info(f"  Pixel MAE          : {global_mae:.2f} px")
+    logger.info(f"  Pixel RMSE         : {global_rmse:.2f} px")
+    logger.info("=" * 60)
+    logger.info(f"  Plots   → '{eval_dir}'")
+    logger.info(f"  Log     → '{log_path}'")
+    logger.info("=" * 60)
 
-    # Plot 01 — Global Metrics
-    print("\n" + "=" * 80)
-    print("GLOBAL METRICS DATA")
-    print("=" * 80)
-    print(f"Normalised MAE: {global_nmae:.4f}")
-    print(f"Normalised RMSE: {global_nrmse:.4f}")
-    print(f"PCK@0.1 (norm): {pck01:.1f}%")
-    print(f"PCK@0.2 (norm): {pck02:.1f}%")
-    print(f"Mean OKS: {mean_oks:.4f}")
-    print(f"OKS@0.5: {oks_global[0.50]:.1f}%")
-    print(f"OKS@0.75: {oks_global[0.75]:.1f}%")
-    print(f"Detection Rate: {det_rate:.1f}%")
-    print(f"Miss Rate: {miss_rate:.1f}%")
-    print(f"MAE — Visible KPs: {vis_str}")
-    print(f"MAE — Occluded KPs: {occ_str}")
-    print(f"Pixel MAE: {global_mae:.2f}px")
-    print(f"Pixel RMSE: {global_rmse:.2f}px")
-    print("=" * 80)
+    # ── Detailed per-section logs + plots ────────────────────────────────────
+
+    # Plot 01
+    logger.info(_SEP)
+    logger.info("GLOBAL METRICS DATA")
+    logger.info(_SEP)
+    logger.info(f"Normalised MAE     : {global_nmae:.4f}")
+    logger.info(f"Normalised RMSE    : {global_nrmse:.4f}")
+    logger.info(f"PCK@0.1 (norm)     : {pck01:.1f}%")
+    logger.info(f"PCK@0.2 (norm)     : {pck02:.1f}%")
+    logger.info(f"Mean OKS           : {mean_oks:.4f}")
+    logger.info(f"OKS@0.5            : {oks_global[0.50]:.1f}%")
+    logger.info(f"OKS@0.75           : {oks_global[0.75]:.1f}%")
+    logger.info(f"Detection Rate     : {det_rate:.1f}%")
+    logger.info(f"Miss Rate          : {miss_rate:.1f}%")
+    logger.info(f"MAE — Visible KPs  : {vis_str}")
+    logger.info(f"MAE — Occluded KPs : {occ_str}")
+    logger.info(f"Pixel MAE          : {global_mae:.2f}px")
+    logger.info(f"Pixel RMSE         : {global_rmse:.2f}px")
+    logger.info(_SEP)
 
     plot_global_metrics(
         all_distances,
@@ -1848,64 +1667,51 @@ def main():
         oks_global,
         mae_vis,
         mae_occ,
-        out_dir,
+        eval_dir,
     )
 
-    # Plot 02 — PCK (normalised thresholds)
-    print_pck_normalized_data(all_norm_distances)
-    plot_pck_normalized(all_norm_distances, out_dir=out_dir)
+    log_pck_normalized_data(all_norm_distances)
+    plot_pck_normalized(all_norm_distances, out_dir=eval_dir)
 
-    # Plot 02b — PCK@20px (pixel)
-    print_pck_pixel_data(all_distances)
-    plot_pck_pixel(all_distances, out_dir=out_dir)
+    log_pck_pixel_data(all_distances)
+    plot_pck_pixel(all_distances, out_dir=eval_dir)
 
-    # Plot 03 — Error histogram
-    print_error_distribution_data(all_distances, all_norm_distances)
-    plot_error_histogram_dual(all_distances, all_norm_distances, out_dir)
+    log_error_distribution_data(all_distances, all_norm_distances)
+    plot_error_histogram_dual(all_distances, all_norm_distances, eval_dir)
 
-    # Plot 04 — CDF
-    print_cdf_key_points(all_distances, all_norm_distances)
-    plot_error_cdf_dual(all_distances, all_norm_distances, out_dir)
+    log_cdf_key_points(all_distances, all_norm_distances)
+    plot_error_cdf_dual(all_distances, all_norm_distances, eval_dir)
 
-    # Plot 05 — Normalised MAE per keypoint
-    print_norm_mae_per_keypoint_data(all_norm_distances)
-    plot_norm_mae_per_keypoint(all_norm_distances, out_dir)
+    log_norm_mae_per_keypoint_data(all_norm_distances)
+    plot_norm_mae_per_keypoint(all_norm_distances, eval_dir)
 
-    # Plot 05b — Pixel MAE per keypoint
-    print_mae_per_keypoint_data(all_distances)
-    plot_mae_per_keypoint(all_distances, out_dir)
+    log_mae_per_keypoint_data(all_distances)
+    plot_mae_per_keypoint(all_distances, eval_dir)
 
-    # Plot 06 — Boxplot per keypoint
-    print_boxplot_statistics(all_distances)
-    plot_boxplot_per_keypoint(all_distances, out_dir)
+    log_boxplot_statistics(all_distances)
+    plot_boxplot_per_keypoint(all_distances, eval_dir)
 
-    # Plot 07 — PCK@0.2 per keypoint
-    print_pck02_per_keypoint_data(all_norm_distances)
-    plot_pck02_per_keypoint(all_norm_distances, out_dir)
+    log_pck02_per_keypoint_data(all_norm_distances)
+    plot_pck02_per_keypoint(all_norm_distances, eval_dir)
 
-    # Plot 08 — Extended stats table
-    print_stats_table_data(all_distances, all_norm_distances)
-    plot_stats_table(all_distances, all_norm_distances, out_dir)
+    log_stats_table_data(all_distances, all_norm_distances)
+    plot_stats_table(all_distances, all_norm_distances, eval_dir)
 
-    # Plot 09 — Group MAE P75
-    print_group_mae_p75_data(all_distances, all_norm_distances)
-    plot_group_mae_p75(all_distances, all_norm_distances, out_dir)
+    log_group_mae_p75_data(all_distances, all_norm_distances)
+    plot_group_mae_p75(all_distances, all_norm_distances, eval_dir)
 
-    # Plot 10 — Group violin
-    # (No additional print needed as it's covered in group statistics)
-    plot_group_violin(all_distances, out_dir)
+    plot_group_violin(all_distances, eval_dir)  # no dedicated log block needed
 
-    # Plot 11 — OKS distribution
-    print_oks_distribution_data(all_oks)
-    plot_oks_distribution(all_oks, out_dir)
+    log_oks_distribution_data(all_oks)
+    plot_oks_distribution(all_oks, eval_dir)
 
-    # Plot 12 — Mean OKS per keypoint
-    print_oks_per_keypoint_data(all_oks)
-    plot_oks_per_keypoint(all_oks, out_dir)
+    log_oks_per_keypoint_data(all_oks)
+    plot_oks_per_keypoint(all_oks, eval_dir)
 
-    # Plot 13 — OKS thresholds per keypoint
-    print_oks_thresholds_per_keypoint_data(oks_per_kp)
-    plot_oks_thresholds_per_keypoint(oks_per_kp, out_dir)
+    log_oks_thresholds_per_keypoint_data(oks_per_kp)
+    plot_oks_thresholds_per_keypoint(oks_per_kp, eval_dir)
+
+    logger.success(f"Evaluation complete.  Plots → '{eval_dir}'  |  Log → '{log_path}'")
 
 
 if __name__ == "__main__":
